@@ -225,6 +225,65 @@ bot.onDirectMessage(async (thread, message) => {
 
 The adapter honors `request.signal`, so calling `stop()` from `useChat` short-circuits the iterator on the server. `task_update` and `plan_update` `StreamChunk`s have no native v1 representation in the UI message stream and are dropped silently.
 
+## Cards and actions
+
+Posting a card writes a `data-chat-card` [data part](https://ai-sdk.dev/docs/ai-sdk-ui/streaming-data) to the response. The part's `id` is the message id, and its `data` carries the card (`card`), a plain-text rendering (`fallbackText`) for clients that don't render cards, and — when `actionSecret` is set — a `seal`.
+
+```tsx
+bot.onDirectMessage(async (thread) => {
+  await thread.post(
+    <Card title="Lunch?">
+      <Actions>
+        <Button id="vote" value="pizza">Pizza</Button>
+        <Button id="vote" value="salad">Salad</Button>
+      </Actions>
+    </Card>
+  );
+});
+
+bot.onAction("vote", async (event) => {
+  await event.thread?.post(`You picked ${event.value}`);
+});
+```
+
+On the client, render card parts with `<ChatCard>` from `@chat-adapter/web/react`, and send a press back as a user message carrying a `data-chat-action` part (`{ cardId, actionId, value }`):
+
+```tsx
+import { ChatCard, useChat } from "@chat-adapter/web/react";
+
+const { messages, sendMessage } = useChat();
+
+{message.parts.map((part, index) =>
+  part.type === "data-chat-card" ? (
+    <ChatCard
+      key={index}
+      part={part}
+      onAction={(action) =>
+        sendMessage({ parts: [{ type: "data-chat-action", data: action }] })
+      }
+    />
+  ) : null
+)}
+```
+
+`<ChatCard>` renders semantic, unstyled markup (title, subtitle, text, images, fields, links, tables, buttons, link buttons, selects, and radio selects) — style it through `className` and the `data-chat-card*` attributes. Vue and Svelte renderers are not included yet; `readCardPart` (exported from every entry point) reads a card part for your own renderer.
+
+### Verifying actions
+
+The request body is client-controlled, and a press arrives in a later request than its card, so the adapter only dispatches a press for a card it sealed:
+
+- the user message carries a `data-chat-action` part and is routed to `chat.processAction` (your `onAction` handlers), not to `processMessage`;
+- the card it names must be in the request's `messages`, with a seal that verifies for this thread under `actionSecret` (HMAC-SHA256 via Web Crypto over the thread id, the card id, and the card's actions and values);
+- the card must offer that action id with that value (a button's value, or one of a select's options).
+
+Anything else is dropped with HTTP 403 and a warning log that omits the action's content. **Without `actionSecret`, cards are still posted but every press is refused.** Tool and approval parts are stripped from a press message just as from any other user message.
+
+A seal proves the adapter posted the card in that thread, not that the press is new: the same card can be pressed again, so make action handlers idempotent (as you would on Slack).
+
+### Editing
+
+`editMessage` (`sentMessage.edit(...)`) can replace a card posted earlier in the **same** response: the card part is written again under the same id, and `useChat` replaces it in place. Editing a text message, or any message after its response has ended, throws `NotImplementedError` — that needs a push channel the adapter doesn't have.
+
 ## Message persistence
 
 `persistMessageHistory` defaults to **`true`**. Web has no platform-side history API, so the only way for chat-sdk handlers to see prior turns via `thread.messages` / `channel.messages` is through the configured state adapter's message history cache. Set it to `false` only if your handler re-derives history from the request body's `messages[]` itself:
@@ -309,6 +368,7 @@ Unlike the React helper, Vue and Svelte return the `Chat` instance directly. Acc
 | `getUser` | Yes | `(request: Request) => WebUser \| null \| Promise<WebUser \| null>`. Resolves the user from the inbound HTTP request. Returning `null` produces HTTP 401. |
 | `persistMessageHistory` | No | Persist incoming message history in the configured state adapter. Default: `true`. |
 | `threadIdFor` | No | Derive a chat-sdk thread id from the resolved user and the useChat conversation id. Default: `web:{user.id}:{conversationId}`. |
+| `actionSecret` | No | Secret used to seal posted cards so their actions can be verified (see [Verifying actions](#verifying-actions)). Without it, every card action is refused. |
 | `logger` | No | Logger instance (defaults to `ConsoleLogger("info")`). |
 
 ## Features
@@ -318,7 +378,7 @@ Unlike the React helper, Vue and Svelte return the `Chat` instance directly. Acc
 | Feature | Supported |
 |---------|-----------|
 | Post message | Yes |
-| Edit message | No (every assistant turn is a fresh streamed response) |
+| Edit message | Cards, within the same response |
 | Delete message | No |
 | File uploads | No (deferred to v2) |
 | Streaming | Native (SSE / UI message stream) |
@@ -328,8 +388,10 @@ Unlike the React helper, Vue and Svelte return the `Chat` instance directly. Acc
 
 | Feature | Supported |
 |---------|-----------|
-| Card format | Markdown only in v1 (cards/JSX deferred to v2) |
-| Buttons | No |
+| Card format | `data-chat-card` part (React `<ChatCard>` renderer) |
+| Buttons | Yes (sealed with `actionSecret`) |
+| Link buttons | Yes |
+| Select menus | Yes |
 | Tables | Yes (GFM markdown) |
 | Modals | No |
 
@@ -356,9 +418,9 @@ Unlike the React helper, Vue and Svelte return the `Chat` instance directly. Acc
 
 ## v1 scope
 
-**In:** text + markdown, native streaming, DM-style routing, persisted message history, abort propagation via `request.signal`.
+**In:** text + markdown, native streaming, DM-style routing, persisted message history, abort propagation via `request.signal`, cards and card actions, card edits within the same response.
 
-**Out (deferred to v2):** cards/JSX rendering, reactions, modals, file uploads, edit/delete, multi-tab proactive push.
+**Out (deferred to v2):** reactions, modals, file uploads, delete, edits after a response has ended, postable objects (`Plan`), multi-tab proactive push.
 
 ## Troubleshooting
 
@@ -370,6 +432,12 @@ Unlike the React helper, Vue and Svelte return the `Chat` instance directly. Acc
 ### Every request returns 400 "Invalid user id"
 
 - The id returned by `getUser` contains a `:` character, which would corrupt the thread-id round-trip. Normalize the id inside `getUser` (for example, `id.replace(/:/g, "_")` or base64-encode it).
+
+### Every card press returns 403
+
+- `actionSecret` isn't set — without it, every press is refused.
+- The client isn't sending the card back: the assistant message holding the `data-chat-card` part (with its `seal`) must be in the request's `messages`. `useChat` sends the whole conversation by default.
+- The press names an action or value the card didn't offer, or the card was changed on the client.
 
 ### `useChat` recreates state on every render
 

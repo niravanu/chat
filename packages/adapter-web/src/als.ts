@@ -10,6 +10,10 @@ import type { UIMessageStreamWriter } from "ai";
  * SSE response body without explicit threading through every method.
  */
 export interface WebRequestContext {
+  /** Ids of the cards posted in this response — the only messages `editMessage` can reach. */
+  cardIds: Set<string>;
+  /** Set once the response has finished; nothing more can be written to it. */
+  closed: boolean;
   /** The useChat conversation id supplied in the request body's `id` field. */
   conversationId: string;
   /** Abort signal of the inbound HTTP request — used to short-circuit streaming. */

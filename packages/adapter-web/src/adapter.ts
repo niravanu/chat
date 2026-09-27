@@ -7,7 +7,11 @@
  * back in the same response body.
  */
 
-import { ValidationError } from "@chat-adapter/shared";
+import {
+  cardToFallbackText,
+  extractCard,
+  ValidationError,
+} from "@chat-adapter/shared";
 import {
   createUIMessageStream,
   createUIMessageStreamResponse,
@@ -17,6 +21,8 @@ import {
 import {
   type Adapter,
   type AdapterPostableMessage,
+  type Author,
+  type CardElement,
   type ChatInstance,
   ConsoleLogger,
   type EmojiValue,
@@ -34,7 +40,16 @@ import {
   type UserInfo,
 } from "chat";
 import { requireWebRequestContext, webRequestContext } from "./als";
+import {
+  ACTION_PART_TYPE,
+  CARD_PART_TYPE,
+  readActionPart,
+  readCardPart,
+  type WebCardAction,
+  type WebCardData,
+} from "./card-part";
 import { WebFormatConverter } from "./format-converter";
+import { cardOffersAction, sealCard, verifyCardSeal } from "./seal";
 import type { WebAdapterConfig, WebUser } from "./types";
 
 /** Decoded thread id components for the Web adapter. */
@@ -69,6 +84,7 @@ export class WebAdapter implements Adapter<WebThreadIdData, UIMessage> {
   protected readonly formatConverter = new WebFormatConverter();
   protected readonly resolveUser: WebAdapterConfig["getUser"];
   protected readonly threadIdFor: NonNullable<WebAdapterConfig["threadIdFor"]>;
+  protected readonly actionSecret: string | undefined;
 
   constructor(opts: WebAdapterConfig) {
     if (!opts.userName) {
@@ -80,8 +96,15 @@ export class WebAdapter implements Adapter<WebThreadIdData, UIMessage> {
         "getUser is required — supply a function that resolves the user from the inbound Request"
       );
     }
+    if (opts.actionSecret !== undefined && !opts.actionSecret) {
+      throw new ValidationError(
+        ADAPTER_NAME,
+        "actionSecret must be a non-empty string when provided"
+      );
+    }
     this.userName = opts.userName;
     this.resolveUser = opts.getUser;
+    this.actionSecret = opts.actionSecret;
     this.threadIdFor = opts.threadIdFor ?? defaultThreadIdFor;
     // Default true: with no platform-side message API, the only way for
     // chat-sdk handlers to see prior turns (via thread/channel.messages) is
@@ -163,9 +186,48 @@ export class WebAdapter implements Adapter<WebThreadIdData, UIMessage> {
       return jsonError(400, "No usable content in last user message");
     }
 
-    const message = this.buildMessageFromUI(sanitizedMessage, threadId, user);
+    // A user message carrying a `data-chat-action` part is a card action, not
+    // a chat message. It is dispatched only if it names a card this adapter
+    // sealed for this thread; anything else is dropped.
+    const actionPart = sanitizedMessage.parts.find(
+      (part) => part.type === ACTION_PART_TYPE
+    );
+    let action: WebCardAction | null = null;
+    if (actionPart) {
+      const verdict = await this.verifyCardAction(
+        actionPart,
+        body.messages,
+        threadId
+      );
+      if (typeof verdict === "string") {
+        // Log why without the action's content: ids and values are client input.
+        this.logger.warn("Dropped card action", { reason: verdict });
+        return jsonError(403, "Card action rejected");
+      }
+      action = verdict;
+    }
 
     const chat = this.chat;
+    const dispatch = (): Promise<void> =>
+      action
+        ? chat.processAction(
+            {
+              adapter: this,
+              actionId: action.actionId,
+              value: action.value,
+              messageId: action.cardId,
+              threadId,
+              user: toAuthor(user),
+              raw: sanitizedMessage,
+            },
+            undefined
+          )
+        : chat.processMessage(
+            this,
+            threadId,
+            this.buildMessageFromUI(sanitizedMessage, threadId, user)
+          );
+
     // `originalMessages` is deliberately not passed: nothing registers
     // onFinish on this stream, so the ai SDK never consumes it, and the
     // client array must not act as a source of prior-turn state anyway.
@@ -174,17 +236,18 @@ export class WebAdapter implements Adapter<WebThreadIdData, UIMessage> {
         const assistantMessageId = generateId();
         writer.write({ type: "start", messageId: assistantMessageId });
         writer.write({ type: "start-step" });
+        const context = {
+          writer,
+          signal: request.signal,
+          userId: user.id,
+          conversationId,
+          cardIds: new Set<string>(),
+          closed: false,
+        };
         try {
-          await webRequestContext.run(
-            {
-              writer,
-              signal: request.signal,
-              userId: user.id,
-              conversationId,
-            },
-            () => chat.processMessage(this, threadId, message)
-          );
+          await webRequestContext.run(context, dispatch);
         } finally {
+          context.closed = true;
           writer.write({ type: "finish-step" });
           writer.write({ type: "finish" });
         }
@@ -269,10 +332,13 @@ export class WebAdapter implements Adapter<WebThreadIdData, UIMessage> {
     message: AdapterPostableMessage
   ): Promise<RawMessage<UIMessage>> {
     const ctx = requireWebRequestContext();
-    const text = adapterPostableToText(message, this.formatConverter);
     const id = generateId();
-    // Skip empty messages (e.g., a CardElement with no fallbackText) so
-    // useChat doesn't render a blank assistant bubble.
+    const card = extractCard(message);
+    if (card) {
+      return this.writeCard(threadId, id, card, message);
+    }
+    const text = adapterPostableToText(message, this.formatConverter);
+    // Skip empty messages so useChat doesn't render a blank assistant bubble.
     if (!text) {
       return {
         id,
@@ -326,19 +392,40 @@ export class WebAdapter implements Adapter<WebThreadIdData, UIMessage> {
     };
   }
 
+  /**
+   * Edit a card posted earlier in the same response. The card's data part is
+   * written again under the same id, and `useChat` replaces the earlier part
+   * in place.
+   *
+   * Anything else throws `NotImplementedError`: a message from a response
+   * that has ended can't be reached without a push channel, and text parts
+   * in the UI message stream are append-only.
+   */
+  async editMessage(
+    threadId: string,
+    messageId: string,
+    message: AdapterPostableMessage
+  ): Promise<RawMessage<UIMessage>> {
+    const ctx = webRequestContext.getStore();
+    if (!ctx || ctx.closed || !ctx.cardIds.has(messageId)) {
+      throw new NotImplementedError(
+        "WebAdapter.editMessage can only edit a card posted earlier in the same response — once a response has ended, its messages can no longer be changed.",
+        "editMessage"
+      );
+    }
+    const card = extractCard(message);
+    if (!card) {
+      throw new NotImplementedError(
+        "WebAdapter.editMessage can only replace a card with another card — text parts in the UI message stream can't be rewritten.",
+        "editMessage"
+      );
+    }
+    return this.writeCard(threadId, messageId, card, message);
+  }
+
   // ---------------------------------------------------------------------------
   // Required-by-interface methods that have no native concept on web (v1 stubs)
   // ---------------------------------------------------------------------------
-
-  editMessage(
-    _threadId: string,
-    _messageId: string,
-    _message: AdapterPostableMessage
-  ): Promise<RawMessage<UIMessage>> {
-    throw new NotImplementedError(
-      "WebAdapter.editMessage is not supported in v1 — every assistant turn is a fresh streamed response."
-    );
-  }
 
   deleteMessage(_threadId: string, _messageId: string): Promise<void> {
     throw new NotImplementedError(
@@ -416,16 +503,91 @@ export class WebAdapter implements Adapter<WebThreadIdData, UIMessage> {
       text,
       formatted: parseMarkdown(text),
       raw: uiMessage,
-      author: {
-        userId: user.id,
-        userName: user.name ?? user.id,
-        fullName: user.name ?? user.id,
-        isBot: false,
-        isMe: false,
-      },
+      author: toAuthor(user),
       metadata: { dateSent: new Date(), edited: false },
       attachments: [],
     });
+  }
+
+  /**
+   * Write a card as a `data-chat-card` part under `id`. Writing the same id
+   * again (an edit) replaces the part in `useChat`'s message.
+   */
+  protected async writeCard(
+    threadId: string,
+    id: string,
+    card: CardElement,
+    message: AdapterPostableMessage
+  ): Promise<RawMessage<UIMessage>> {
+    const ctx = requireWebRequestContext();
+    const fallbackText =
+      (typeof message === "object" &&
+        "card" in message &&
+        message.fallbackText) ||
+      cardToFallbackText(card, { boldFormat: "**" });
+    const data: WebCardData = { card, fallbackText };
+    if (this.actionSecret) {
+      data.seal = await sealCard(this.actionSecret, threadId, id, card);
+    }
+    ctx.writer.write({ type: CARD_PART_TYPE, id, data });
+    ctx.cardIds.add(id);
+    return {
+      id,
+      threadId,
+      raw: {
+        id,
+        role: "assistant",
+        parts: [{ type: CARD_PART_TYPE, id, data }],
+      },
+    };
+  }
+
+  /**
+   * Check a `data-chat-action` part against the card it names. Returns the
+   * action when the card is in the request's messages, its seal verifies for
+   * this thread, and it offered that action and value; otherwise the reason
+   * it was rejected.
+   *
+   * Only sealed card parts are read from the rest of the (client-controlled)
+   * messages array — the seal is what makes them trustworthy.
+   */
+  protected async verifyCardAction(
+    part: unknown,
+    messages: UIMessage[],
+    threadId: string
+  ): Promise<WebCardAction | string> {
+    const secret = this.actionSecret;
+    if (!secret) {
+      return "actionSecret is not configured";
+    }
+    const action = readActionPart(part);
+    if (!action) {
+      return "malformed action part";
+    }
+    for (const candidate of messages) {
+      if (candidate?.role !== "assistant" || !Array.isArray(candidate.parts)) {
+        continue;
+      }
+      for (const candidatePart of candidate.parts) {
+        const card = readCardPart(candidatePart);
+        if (
+          card?.id === action.cardId &&
+          card.seal &&
+          (await verifyCardSeal(
+            secret,
+            threadId,
+            card.id,
+            card.card,
+            card.seal
+          ))
+        ) {
+          return cardOffersAction(card.card, action.actionId, action.value)
+            ? action
+            : "action not offered by card";
+        }
+      }
+    }
+    return "no sealed card found for action";
   }
 }
 
@@ -485,11 +647,18 @@ function adapterPostableToText(
   if ("ast" in message) {
     return formatConverter.fromAst(message.ast);
   }
-  if ("card" in message) {
-    return message.fallbackText ?? "";
-  }
-  // CardElement direct — degrade to empty (cards are out-of-scope for v1)
+  // Cards are written as `data-chat-card` parts by postMessage, never as text.
   return "";
+}
+
+function toAuthor(user: WebUser): Author {
+  return {
+    userId: user.id,
+    userName: user.name ?? user.id,
+    fullName: user.name ?? user.id,
+    isBot: false,
+    isMe: false,
+  };
 }
 
 function assistantUIMessageFromText(id: string, text: string): UIMessage {

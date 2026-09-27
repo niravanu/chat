@@ -10,6 +10,20 @@ export interface WebUser {
 
 export interface WebAdapterConfig {
   /**
+   * Secret used to seal posted cards so their actions can be verified.
+   *
+   * A card action (button press or select) arrives as a `data-chat-action`
+   * part in a later request, and the request body is client-controlled. When
+   * set, every posted card carries an HMAC-SHA256 seal over the thread id, the
+   * card id and the card's actions; an action is dispatched to `onAction` only
+   * if its sealed card is in the request's messages, the seal verifies, and
+   * the card offered that action and value.
+   *
+   * Default: unset — cards are still posted, but every card action is refused.
+   * Use a long random value and keep it server-side (e.g. an env var).
+   */
+  actionSecret?: string;
+  /**
    * Resolve the user from the inbound HTTP request.
    *
    * Required — this is the security boundary for the Web adapter. Returning

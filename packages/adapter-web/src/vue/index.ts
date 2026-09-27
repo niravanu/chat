@@ -61,3 +61,12 @@ export function useChat<UI_MESSAGE extends UIMessage = UIMessage>(
 
 export type { Chat } from "@ai-sdk/vue";
 export type { UIMessage } from "ai";
+export {
+  ACTION_PART_TYPE,
+  CARD_PART_TYPE,
+  readActionPart,
+  readCardPart,
+  type WebCardAction,
+  type WebCardData,
+  type WebCardPart,
+} from "../card-part";

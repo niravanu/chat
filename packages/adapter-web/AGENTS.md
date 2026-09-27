@@ -36,10 +36,13 @@ packages/adapter-web/
 │   ├── index.ts             # createWebAdapter factory + public types
 │   ├── adapter.ts           # WebAdapter class implementation
 │   ├── als.ts               # AsyncLocalStorage scope for the active request
+│   ├── card-part.ts         # data-chat-card / data-chat-action part helpers (framework-agnostic)
 │   ├── format-converter.ts  # WebFormatConverter (mdast ↔ markdown)
 │   ├── index.test.ts
+│   ├── seal.ts              # HMAC-SHA256 card seals (Web Crypto)
 │   ├── types.ts             # WebUser, request shape, postable types
 │   └── react/
+│       ├── chat-card.tsx    # <ChatCard> renderer for data-chat-card parts
 │       └── index.ts         # useChat wrapper for the React entry point
 ├── package.json
 ├── tsconfig.json
@@ -77,7 +80,7 @@ Server entry (`@chat-adapter/web` → `src/index.ts`):
 
 - `createWebAdapter(config)` — primary factory. Required:
   `userName` (bot name) and `getUser(request)` resolver. Optional:
-  `persistMessageHistory`, `threadIdFor`, `logger`.
+  `actionSecret`, `persistMessageHistory`, `threadIdFor`, `logger`.
 - `WebAdapter` class — implements `Adapter<WebThreadId, unknown>`.
   Public methods: `handleWebhook` (mounted at `/api/chat` etc.),
   `postMessage`, `editMessage`, `deleteMessage`, `addReaction`,
@@ -85,12 +88,17 @@ Server entry (`@chat-adapter/web` → `src/index.ts`):
   `fetchSingleMessage`, `openDM`.
 - Configuration: `WebAdapterConfig`, `WebUser`, `WebThreadId`.
 - `encodeThreadId`, `decodeThreadId`, `isDM`.
+- Card part helpers (also exported from every client entry):
+  `CARD_PART_TYPE`, `ACTION_PART_TYPE`, `readCardPart`,
+  `readActionPart`, `WebCardData`, `WebCardAction`, `WebCardPart`.
 
 React entry (`@chat-adapter/web/react` → `src/react/index.ts`):
 
 - `useChat(options)` — wraps `@ai-sdk/react`'s `useChat` with a
   `DefaultChatTransport` preconfigured to talk to the Web adapter
   endpoint.
+- `<ChatCard part onAction />` — renders a `data-chat-card` part as
+  semantic, unstyled markup and reports presses as `WebCardAction`s.
 
 ## Thread ID format
 
@@ -124,8 +132,12 @@ chat route (typically `/api/chat`). It:
    file, and `data-*` parts pass through.
 3. Resolves the thread id via `threadIdFor` (default
    `web:{user.id}:{conversationId}`).
-4. Routes to `chat.processMessage`, which persists the message into
-   the configured state adapter when `persistMessageHistory: true`.
+4. If the message carries a `data-chat-action` part, verifies it
+   against the sealed `data-chat-card` part it names (see Cards and
+   actions below) and routes it to `chat.processAction`; a press that
+   fails verification gets HTTP 403. Otherwise routes to
+   `chat.processMessage`, which persists the message into the
+   configured state adapter when `persistMessageHistory: true`.
 5. Streams the handler's `thread.post` output back to the browser as
    SSE chunks following the AI message stream protocol.
 
@@ -169,6 +181,24 @@ bot.onDirectMessage(async (thread, message) => {
 
 The adapter honours `request.signal`, so the iterator is short-
 circuited as soon as the browser disconnects.
+
+## Cards and actions
+
+- `postMessage` with a card writes one `data-chat-card` data part
+  (`{ card, fallbackText, seal? }`) under the message id.
+- With `actionSecret` set, the part carries an HMAC-SHA256 seal
+  (`seal.ts`, Web Crypto) over the thread id, the card id and the
+  card's offered actions (enabled buttons, and each select / radio
+  select option). Without it, every press is refused.
+- A press is accepted only if the sealed card is in the request's
+  `messages`, the seal verifies for this thread, and the card offered
+  that action id and value. Only sealed card parts are read from the
+  rest of the client-controlled array. Rejections log a reason, never
+  the action's content.
+- `editMessage` works only for a card posted earlier in the same
+  response (tracked in the request context): the part is rewritten
+  under the same id and `useChat` replaces it. Text edits and edits
+  after the response has ended throw `NotImplementedError`.
 
 ## Format conversion
 
@@ -222,9 +252,9 @@ there's nothing magical in the wrapper.
 
 ## Web quirks worth remembering
 
-- **No platform side.** Many adapter behaviours (reactions, edit /
-  delete, file uploads, modals) are no-ops because the browser
-  renderer doesn't need them. The contract methods exist but throw
+- **No platform side.** Many adapter behaviours (reactions, delete,
+  edits after a response, file uploads, modals) are no-ops because the
+  browser renderer doesn't need them. The contract methods exist but throw
   `NotImplementedError` for the unsupported ones.
 - **Aborts on unmount.** When the user navigates away, the browser
   closes the SSE connection. The adapter forwards that as
@@ -234,9 +264,9 @@ there's nothing magical in the wrapper.
   scoped.
 - **No webhook signature**, no platform secret. `getUser` is
   everything.
-- **Text-only formatting.** Cards, modals, and reactions are not
-  exposed in the v1 protocol — the browser handles all rich UI
-  itself via `ai-elements` or custom React.
+- **Cards are data parts.** Cards travel as `data-chat-card` parts
+  and are rendered by the client (`<ChatCard>` or your own renderer).
+  Modals and reactions are not exposed.
 
 ## Testing approach
 

@@ -4,6 +4,15 @@ import { WebAdapter } from "./adapter";
 import type { WebAdapterConfig } from "./types";
 
 export { WebAdapter, type WebThreadIdData } from "./adapter";
+export {
+  ACTION_PART_TYPE,
+  CARD_PART_TYPE,
+  readActionPart,
+  readCardPart,
+  type WebCardAction,
+  type WebCardData,
+  type WebCardPart,
+} from "./card-part";
 export { WebFormatConverter } from "./format-converter";
 export type {
   WebAdapterConfig,

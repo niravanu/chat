@@ -9,7 +9,9 @@ tagline: Lets a Chat SDK bot serve a browser chat UI alongside Slack, Teams, Dis
 beta: true
 features:
   postMessage: yes
-  editMessage: no
+  editMessage:
+    status: partial
+    label: Cards, same response
   deleteMessage: no
   fileUploads: no
   streaming:
@@ -17,16 +19,16 @@ features:
     label: Native (SSE)
   scheduledMessages: no
   cardFormat:
-    status: partial
-    label: Markdown only (v1)
-  buttons: no
-  linkButtons: no
-  selectMenus: no
+    status: yes
+    label: Data part
+  buttons: yes
+  linkButtons: yes
+  selectMenus: yes
   tables:
     status: yes
     label: GFM
-  fields: no
-  imagesInCards: no
+  fields: yes
+  imagesInCards: yes
   modals: no
   slashCommands: no
   mentions: no
@@ -177,6 +179,11 @@ const chat = useChat({ api: "/api/chat" });
       description:
         "Override how thread ids are derived. Default: `web:{user.id}:{conversationId}`.",
     },
+    actionSecret: {
+      type: "string",
+      description:
+        "Secret used to seal posted cards so their actions can be verified. Without it, cards are still posted but every card action is refused.",
+    },
     logger: {
       type: "Logger",
       description: 'Defaults to `ConsoleLogger("info")`.',
@@ -257,6 +264,64 @@ bot.onDirectMessage(async (thread, message) => {
 ```
 
 The adapter honors `request.signal`, so calling `stop()` from `useChat` short-circuits the iterator on the server.
+
+### Cards and actions
+
+Posting a card writes a `data-chat-card` data part to the response: the part's `id` is the message id, and its `data` carries the card, a plain-text `fallbackText` for clients that don't render cards, and — when `actionSecret` is set — a `seal`.
+
+```tsx title="lib/bot.tsx" lineNumbers
+bot.onDirectMessage(async (thread) => {
+  await thread.post(
+    <Card title="Lunch?">
+      <Actions>
+        <Button id="vote" value="pizza">Pizza</Button>
+        <Button id="vote" value="salad">Salad</Button>
+      </Actions>
+    </Card>
+  );
+});
+
+bot.onAction("vote", async (event) => {
+  await event.thread?.post(`You picked ${event.value}`);
+});
+```
+
+On the client, render card parts with `<ChatCard>` from `@chat-adapter/web/react` and send a press back as a `data-chat-action` part:
+
+```tsx title="app/chat/page.tsx" lineNumbers
+import { ChatCard, useChat } from "@chat-adapter/web/react";
+
+const { messages, sendMessage } = useChat();
+
+{message.parts.map((part, index) =>
+  part.type === "data-chat-card" ? (
+    <ChatCard
+      key={index}
+      part={part}
+      onAction={(action) =>
+        sendMessage({ parts: [{ type: "data-chat-action", data: action }] })
+      }
+    />
+  ) : null
+)}
+```
+
+`<ChatCard>` renders semantic, unstyled markup — style it through `className` and the `data-chat-card*` attributes. Vue and Svelte renderers are not included yet; `readCardPart`, exported from every entry point, reads a card part for your own renderer.
+
+A press is routed to `onAction`, not `onDirectMessage`, and only when:
+
+- the card it names is in the request's `messages`, with a seal that verifies for this thread under `actionSecret` (HMAC-SHA256 over the thread id, the card id, and the card's actions and values);
+- the card offered that action id with that value.
+
+Anything else is dropped with HTTP 403 and a warning log that omits the action's content.
+
+<Callout type="warn">
+Without `actionSecret`, every card action is refused.
+</Callout>
+
+A seal proves the adapter posted the card in that thread, not that the press is new — make action handlers idempotent.
+
+`sentMessage.edit(...)` can replace a card posted earlier in the same response; `useChat` replaces the part in place. Editing text, or anything after its response has ended, throws `NotImplementedError`.
 
 ### Message persistence
 
